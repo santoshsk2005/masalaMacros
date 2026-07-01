@@ -1,0 +1,170 @@
+// masalaMacros data model — see SPEC.md §7.1
+// Dev datasource is SQLite for zero-ops local development.
+// Production target is PostgreSQL (swap provider + DATABASE_URL; JSON stored as
+// String here for SQLite compatibility maps cleanly to Postgres jsonb later).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  // Profile used to auto-calculate targets (Mifflin-St Jeor)
+  sex          String? // "male" | "female"
+  age          Int?
+  heightCm     Float?
+  weightKg     Float?
+  activityLevel String? // "sedentary" | "light" | "moderate" | "active" | "very_active"
+  goal         String? // "lose" | "maintain" | "gain"
+  dietaryType  String   @default("vegetarian") // vegetarian | nonvegetarian | vegan | jain | eggetarian
+  allergies    String? // JSON array of strings
+  healthFoci   String? // JSON array: ["general","weight","glycemic","protein"]
+  createdAt    DateTime @default(now())
+
+  targets      Target[]
+  meals        Meal[]
+  assessments  Assessment[]
+  portionUnits PortionUnit[]
+}
+
+// Daily nutrient targets. Can be date-ranged for weight phases. `isOverride`
+// marks manually edited targets so auto-recalc won't clobber them.
+model Target {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  effectiveFrom DateTime @default(now())
+  calories   Float
+  proteinG   Float
+  carbG      Float
+  fatG       Float
+  fiberG     Float
+  sodiumMaxMg Float?
+  addedSugarMaxG Float?
+  isOverride Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([userId, effectiveFrom])
+}
+
+// Base food composition, per 100g edible portion. Seeded from IFCT + USDA.
+model Ingredient {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  aliases     String? // JSON array
+  source      String  @default("curated") // curated | ifct | usda | ai-estimated
+  // Macros per 100g
+  calories    Float
+  proteinG    Float
+  carbG       Float
+  sugarG      Float   @default(0)
+  fatG        Float
+  satFatG     Float   @default(0)
+  fiberG      Float   @default(0)
+  // Key micros per 100g
+  ironMg      Float   @default(0)
+  calciumMg   Float   @default(0)
+  b12Ug       Float   @default(0)
+  folateUg    Float   @default(0)
+  sodiumMg    Float   @default(0)
+  potassiumMg Float   @default(0)
+  // Glycemic index (0-100), null if not applicable/unknown
+  glycemicIndex Float?
+
+  dishComponents DishComponent[]
+  mealItems      MealItem[]
+}
+
+// A composite dish expressed as an ingredient breakdown (the moat). Nutrients
+// are computed from components, not guessed wholesale.
+model Dish {
+  id             String  @id @default(cuid())
+  name           String  @unique
+  aliases        String? // JSON array
+  cuisine        String  @default("indian") // indian | mexican | italian | ...
+  region         String? // punjabi | tamil | bengali | gujarati | ...
+  cookingMethod  String? // fried | tadka | dry | steamed | roasted | raw | curry
+  // Default serving for quick-add
+  servingUnit    String  @default("katori")
+  servingGrams   Float
+  source         String  @default("curated")
+  verified       Boolean @default(true)
+  components     DishComponent[]
+  mealItems      MealItem[]
+}
+
+model DishComponent {
+  id           String     @id @default(cuid())
+  dishId       String
+  dish         Dish       @relation(fields: [dishId], references: [id], onDelete: Cascade)
+  ingredientId String
+  ingredient   Ingredient @relation(fields: [ingredientId], references: [id])
+  // grams of this ingredient in ONE serving (servingGrams) of the dish
+  grams        Float
+
+  @@unique([dishId, ingredientId])
+}
+
+// Household unit -> grams, per food class. userId null = global default.
+model PortionUnit {
+  id        String  @id @default(cuid())
+  name      String // "katori" | "roti" | "dosa" | "cup" | "glass" | ...
+  foodClass String  @default("*") // "*" = generic; else e.g. "rice", "dal", "curry"
+  grams     Float
+  userId    String?
+  user      User?   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([name, foodClass])
+}
+
+model Meal {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  eatenAt   DateTime   @default(now())
+  mealType  String     @default("meal") // breakfast | lunch | dinner | snack | meal
+  note      String?
+  rawText   String? // original NL input, for auditing/curation
+  items     MealItem[]
+  createdAt DateTime   @default(now())
+
+  @@index([userId, eatenAt])
+}
+
+model MealItem {
+  id           String      @id @default(cuid())
+  mealId       String
+  meal         Meal        @relation(fields: [mealId], references: [id], onDelete: Cascade)
+  dishId       String?
+  dish         Dish?       @relation(fields: [dishId], references: [id])
+  ingredientId String?
+  ingredient   Ingredient? @relation(fields: [ingredientId], references: [id])
+  label        String // as parsed/displayed, e.g. "dal tadka"
+  quantity     Float   @default(1)
+  unit         String  @default("katori")
+  grams        Float // resolved grams (quantity * unit->grams)
+  // Cached computed nutrients for this item (JSON) + provenance
+  nutrients    String // JSON of NutrientVector
+  source       String  @default("curated") // curated | ifct | usda | ai-estimated
+  confidence   Float   @default(1)
+}
+
+// Persisted pre-eat assessment cards, for history and future personalization.
+model Assessment {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rawText   String
+  result    String // JSON: verdict, score, benefits, concerns, adjustments, dayFit
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
